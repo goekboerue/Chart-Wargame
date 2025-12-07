@@ -15,23 +15,27 @@ export interface ChartAnalysis {
     support: number;
     resistance: number;
   };
+  model_used?: string;
 }
 
 export interface MarketData {
   summary: string;
   headlines: string[];
   sources: { title: string; uri: string }[];
+  model_used?: string;
 }
 
 export interface SimulationResult {
   analysis: string;
   ghost_candles: GhostCandle[];
+  model_used?: string;
 }
 
 export interface BacktestResult {
   score: number; // 0-100
   critique: string;
   timestamp: number;
+  model_used?: string;
 }
 
 export interface SavedSimulation {

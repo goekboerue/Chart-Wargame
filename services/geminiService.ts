@@ -1,6 +1,6 @@
 import { GoogleGenAI, Schema, Type } from "@google/genai";
 import { ChartAnalysis, SimulationResult, MarketData, GhostCandle, BacktestResult } from "../types";
-import { MODEL_NAME } from "../constants";
+import { MODEL_NAME, FALLBACK_MODEL_NAME } from "../constants";
 
 // Declare process to avoid TypeScript build errors
 declare var process: {
@@ -50,57 +50,105 @@ const withTimeout = <T>(promise: Promise<T>, ms: number, errorMessage: string): 
   ]);
 };
 
-type StatusCallback = (msg: string) => void;
-
-// --- CORE SERVICE ---
-
-async function callWithRetry<T>(
-  fn: () => Promise<T>, 
-  retries = 2, 
-  delay = 2000, 
-  context = "API Call",
-  onUpdate?: StatusCallback
-): Promise<T> {
-  try {
-    return await withTimeout(fn(), 15000, `${context} took too long.`);
-  } catch (error: any) {
-    const msg = error?.message || "";
-    
-    // Check for Hard Quota Limits (Daily Limit)
-    // 429 can be Rate Limit (temporary) or Quota Limit (Daily hard stop)
-    // We treat persistent 429s as critical errors now, per user request.
-    const isRateLimit = msg.includes("429") || msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED");
-
-    if (isRateLimit) {
-        if (retries > 0) {
-            // It might be a temporary rate limit (RPM), so we try a few times.
-            const nextDelay = delay + 2000;
-            if (onUpdate) onUpdate(`⚠️ HIGH TRAFFIC (429). RETRYING IN ${nextDelay/1000}s...`);
-            await wait(nextDelay);
-            return callWithRetry(fn, retries - 1, nextDelay, context, onUpdate);
-        } else {
-            // If retries failed, it's likely a Daily Quota issue or severe congestion.
-            // WE DO NOT FALLBACK TO FAKE DATA. WE THROW.
-            throw new Error(`⚠️ CRITICAL: API QUOTA EXCEEDED (429). TRY AGAIN TOMORROW.`);
-        }
-    }
-
-    const isTransient = msg.includes("fetch failed") || msg.includes("503");
-    
-    if (isTransient && retries > 0) {
-      const nextDelay = delay + 1000;
-      if (onUpdate) onUpdate(`⚠️ CONNECTION ERROR. RETRYING...`);
-      await wait(nextDelay);
-      return callWithRetry(fn, retries - 1, nextDelay, context, onUpdate);
-    }
-
-    throw error;
-  }
-}
-
 const cleanJsonString = (text: string): string => {
   return text.replace(/```json|```/g, '').trim();
 };
+
+type StatusCallback = (msg: string) => void;
+
+// --- DUAL-ENGINE EXECUTION CORE ---
+
+/**
+ * Executes a GenAI request with Fallback logic.
+ * 1. Tries PRIMARY model.
+ * 2. If Quota/Rate Limit (429) -> Switches to FALLBACK model.
+ * 3. Returns data + model name.
+ */
+async function executeWithModelFallback<T>(
+  operationName: string,
+  onUpdate: StatusCallback | undefined,
+  apiCall: (model: string) => Promise<T>
+): Promise<T & { model_used: string }> {
+  
+  const models = [MODEL_NAME, FALLBACK_MODEL_NAME];
+  let lastError: any = null;
+
+  for (let i = 0; i < models.length; i++) {
+    const currentModel = models[i];
+    const isFallback = i > 0;
+
+    try {
+      if (isFallback && onUpdate) {
+        onUpdate(`⚠️ PRIMARY ENGINE LIMIT. ENGAGING FALLBACK (${currentModel})...`);
+        await wait(1000); // Brief cool-down before switching engines
+      } else if (onUpdate) {
+        // Normal update
+      }
+
+      // WRAPPER: Retry logic PER MODEL
+      // We try the *current* model a couple of times for transient errors
+      // If it's a hard 429, we break this inner loop to go to the next model
+      const result = await attemptModelExecution(apiCall, currentModel, operationName, onUpdate);
+      
+      return { ...result, model_used: currentModel };
+
+    } catch (error: any) {
+      lastError = error;
+      const msg = error?.message || "";
+      const isQuota = msg.includes("429") || msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED");
+
+      if (isQuota) {
+        // If this was the last model, throw
+        if (i === models.length - 1) {
+           throw new Error(`⚠️ CRITICAL: ALL ENGINES DEPLETED. TRY AGAIN TOMORROW.`);
+        }
+        // Otherwise, continue to next model (Fallback)
+        console.warn(`Model ${currentModel} exhausted. Switching...`);
+        continue; 
+      }
+
+      // If it's not a quota error (e.g. Invalid Image, Content Policy), don't switch models, just fail.
+      throw error;
+    }
+  }
+
+  throw lastError;
+}
+
+// Inner helper to handle transient retries for a SINGLE model
+async function attemptModelExecution<T>(
+  apiCall: (model: string) => Promise<T>,
+  model: string,
+  context: string,
+  onUpdate?: StatusCallback
+): Promise<T> {
+  let retries = 2; // Reduced retries per model
+  let delay = 2000;
+
+  while (true) {
+    try {
+      return await withTimeout(apiCall(model), 20000, `${context} (${model})`);
+    } catch (error: any) {
+      const msg = error?.message || "";
+      const isTransient = msg.includes("fetch failed") || msg.includes("503");
+      const isQuota = msg.includes("429") || msg.includes("quota");
+
+      // Immediate fail to outer loop if Quota
+      if (isQuota) throw error; 
+
+      if (isTransient && retries > 0) {
+        if (onUpdate) onUpdate(`⚠️ RETRYING ${context}... (${retries})`);
+        await wait(delay);
+        retries--;
+        delay += 1000;
+        continue;
+      }
+      
+      throw error;
+    }
+  }
+}
+
 
 // --- SCHEMAS ---
 
@@ -161,32 +209,35 @@ export const analyzeChart = async (imageBase64: string, onUpdate?: StatusCallbac
   const base64Data = imageBase64.split(',')[1] || imageBase64;
 
   const prompt = `
-  **ROLE:** Expert Technical Analyst (NO HALLUCINATIONS).
+  **ROLE:** Expert Technical Analyst.
   **TASK:** Analyze chart. Identify Ticker, Trend, Levels.
   **FORMAT:** JSON only.
   `;
 
-  // No try/catch for fallback. Errors propagate to UI.
-  return await callWithRetry(async () => {
-    const response = await client.models.generateContent({
-      model: MODEL_NAME,
-      contents: {
-        parts: [
-          { inlineData: { mimeType: "image/png", data: base64Data } },
-          { text: prompt },
-        ],
-      },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: ANALYSIS_SCHEMA,
-        temperature: 0.1, // Reduced temperature for strictness
-      },
-    });
+  return await executeWithModelFallback(
+    "Chart Analysis",
+    onUpdate,
+    async (model) => {
+      const response = await client.models.generateContent({
+        model: model,
+        contents: {
+          parts: [
+            { inlineData: { mimeType: "image/png", data: base64Data } },
+            { text: prompt },
+          ],
+        },
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: ANALYSIS_SCHEMA,
+          temperature: 0.1, 
+        },
+      });
 
-    const text = response.text;
-    if (!text) throw new Error("Empty response from AI.");
-    return JSON.parse(cleanJsonString(text)) as ChartAnalysis;
-  }, 2, 2000, "Chart Analysis", onUpdate);
+      const text = response.text;
+      if (!text) throw new Error("Empty response from AI.");
+      return JSON.parse(cleanJsonString(text)) as ChartAnalysis;
+    }
+  );
 };
 
 export const fetchMarketContext = async (ticker: string, technicalContext?: string, onUpdate?: StatusCallback): Promise<MarketData> => {
@@ -199,30 +250,34 @@ export const fetchMarketContext = async (ticker: string, technicalContext?: stri
   Output: Summary | Headlines list.
   `;
 
+  // Market data relies on tools. If fallback model doesn't support tools, this might fail or fallback to text only.
+  // 2.0 Flash Lite usually supports tools, but let's be careful.
   try {
-    return await callWithRetry(async () => {
-        const response = await client.models.generateContent({
-        model: MODEL_NAME,
-        contents: prompt,
-        config: { tools: [{ googleSearch: {} }] },
-        });
+     return await executeWithModelFallback(
+      "Market Intel",
+      onUpdate,
+      async (model) => {
+          const response = await client.models.generateContent({
+          model: model,
+          contents: prompt,
+          config: { tools: [{ googleSearch: {} }] },
+          });
 
-        const fullText = response.text || "No data.";
-        const lines = fullText.split('\n').filter(l => l.length > 5);
-        const summary = lines[0] || "Data unavailable";
-        const headlines = lines.slice(1, 4).map(l => l.replace(/^[*\-•]/, '').trim());
-        
-        const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-        const sources = chunks
-        .map((chunk: any) => chunk.web)
-        .filter((web: any) => web?.uri && web?.title)
-        .map((web: any) => ({ title: web.title, uri: web.uri }));
+          const fullText = response.text || "No data.";
+          const lines = fullText.split('\n').filter(l => l.length > 5);
+          const summary = lines[0] || "Data unavailable";
+          const headlines = lines.slice(1, 4).map(l => l.replace(/^[*\-•]/, '').trim());
+          
+          const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+          const sources = chunks
+          .map((chunk: any) => chunk.web)
+          .filter((web: any) => web?.uri && web?.title)
+          .map((web: any) => ({ title: web.title, uri: web.uri }));
 
-        return { summary, headlines, sources };
-    }, 1, 2000, "Market Intel", onUpdate);
-    
+          return { summary, headlines, sources };
+      }
+    );
   } catch (error) {
-    // For market data, we can just return empty, but NO FAKE NEWS.
     console.warn("Market data skipped:", error);
     return { summary: "REAL-TIME DATA UNAVAILABLE.", headlines: [], sources: [] };
   }
@@ -248,27 +303,30 @@ export const runSimulation = async (
   **TASK:** 10 Ghost Candles JSON. Strict technical adherence.
   `;
 
-  // No try/catch for fallback.
-  return await callWithRetry(async () => {
-    const response = await client.models.generateContent({
-      model: MODEL_NAME,
-      contents: {
-        parts: [
-          { inlineData: { mimeType: "image/png", data: base64Data } },
-          { text: prompt },
-        ],
-      },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: SIMULATION_SCHEMA,
-        temperature: 0.4, // Slightly stricter temperature
-      },
-    });
+  return await executeWithModelFallback(
+    "Simulation",
+    onUpdate,
+    async (model) => {
+      const response = await client.models.generateContent({
+        model: model,
+        contents: {
+          parts: [
+            { inlineData: { mimeType: "image/png", data: base64Data } },
+            { text: prompt },
+          ],
+        },
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: SIMULATION_SCHEMA,
+          temperature: 0.4, 
+        },
+      });
 
-    const text = response.text;
-    if (!text) throw new Error("No simulation data.");
-    return JSON.parse(cleanJsonString(text)) as SimulationResult;
-  }, 2, 2000, "Simulation", onUpdate);
+      const text = response.text;
+      if (!text) throw new Error("No simulation data.");
+      return JSON.parse(cleanJsonString(text)) as SimulationResult;
+    }
+  );
 };
 
 export const calculateBacktestScore = async (
@@ -286,29 +344,33 @@ export const calculateBacktestScore = async (
   **RETURN:** JSON {score, critique}.
   `;
 
-  return await callWithRetry(async () => {
-    const response = await client.models.generateContent({
-      model: MODEL_NAME,
-      contents: {
-        parts: [
-          { inlineData: { mimeType: "image/png", data: base64Data } },
-          { text: prompt },
-        ],
-      },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: BACKTEST_SCHEMA,
-        temperature: 0.1,
-      },
-    });
+  return await executeWithModelFallback(
+    "Backtest",
+    onUpdate,
+    async (model) => {
+      const response = await client.models.generateContent({
+        model: model,
+        contents: {
+          parts: [
+            { inlineData: { mimeType: "image/png", data: base64Data } },
+            { text: prompt },
+          ],
+        },
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: BACKTEST_SCHEMA,
+          temperature: 0.1,
+        },
+      });
 
-    const text = response.text;
-    if (!text) throw new Error("Judge silent.");
-    const result = JSON.parse(cleanJsonString(text));
-    return {
-      score: result.score,
-      critique: result.critique,
-      timestamp: Date.now()
-    };
-  }, 2, 2000, "Backtest", onUpdate);
+      const text = response.text;
+      if (!text) throw new Error("Judge silent.");
+      const result = JSON.parse(cleanJsonString(text));
+      return {
+        score: result.score,
+        critique: result.critique,
+        timestamp: Date.now()
+      };
+    }
+  );
 };
