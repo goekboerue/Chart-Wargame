@@ -9,6 +9,14 @@ import BacktestModal from './components/BacktestModal';
 import { Crosshair, AlertOctagon, Terminal, Cpu, ScanEye, ArrowRight, Radio, Save, Clock, Share2, Check, BarChart3, Newspaper, Globe, RefreshCw, Edit3 } from 'lucide-react';
 import { toPng } from 'html-to-image';
 
+// Declare process for TypeScript build
+declare var process: {
+  env: {
+    API_KEY?: string;
+    [key: string]: string | undefined;
+  };
+};
+
 const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
   const [image, setImage] = useState<string | null>(null);

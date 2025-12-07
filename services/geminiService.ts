@@ -2,11 +2,18 @@ import { GoogleGenAI, Schema, Type } from "@google/genai";
 import { ChartAnalysis, SimulationResult, MarketData, GhostCandle, BacktestResult } from "../types";
 import { MODEL_NAME } from "../constants";
 
+// Declare process to avoid TypeScript build errors
+declare var process: {
+  env: {
+    API_KEY?: string;
+    [key: string]: string | undefined;
+  };
+};
+
 const getClient = () => {
   const apiKey = process.env.API_KEY;
   if (!apiKey) {
     console.error("API Key is missing. Check your environment variables.");
-    // We don't throw here immediately to allow the UI to render the error state gracefully if possible
   }
   return new GoogleGenAI({ apiKey: apiKey || "" });
 };
@@ -86,6 +93,11 @@ const BACKTEST_SCHEMA: Schema = {
   required: ["score", "critique"],
 };
 
+// Helper to clean JSON string from Markdown code blocks
+const cleanJsonString = (text: string): string => {
+  return text.replace(/```json|```/g, '').trim();
+};
+
 export const analyzeChart = async (imageBase64: string): Promise<ChartAnalysis> => {
   const client = getClient();
   const base64Data = imageBase64.split(',')[1] || imageBase64;
@@ -120,20 +132,19 @@ export const analyzeChart = async (imageBase64: string): Promise<ChartAnalysis> 
       config: {
         responseMimeType: "application/json",
         responseSchema: ANALYSIS_SCHEMA,
-        temperature: 0.2, // Lower temperature for more accurate extraction
+        temperature: 0.2, 
       },
     });
 
     const text = response.text;
     if (!text) throw new Error("Observer failed to respond.");
-    return JSON.parse(text) as ChartAnalysis;
+    return JSON.parse(cleanJsonString(text)) as ChartAnalysis;
   } catch (error) {
     console.error("Analysis failed:", error);
     throw error;
   }
 };
 
-// New Service: The Scout (Search Grounding)
 export const fetchMarketContext = async (ticker: string, technicalContext?: string): Promise<MarketData> => {
   const client = getClient();
   
@@ -163,7 +174,6 @@ export const fetchMarketContext = async (ticker: string, technicalContext?: stri
       contents: prompt,
       config: {
         tools: [{ googleSearch: {} }],
-        // responseSchema is NOT allowed with googleSearch, we must parse text.
       },
     });
 
@@ -176,9 +186,9 @@ export const fetchMarketContext = async (ticker: string, technicalContext?: stri
     
     const headlines = headlinesRaw
       .split('\n')
-      .map(line => line.trim().replace(/^[-*•]\s*/, '')) // Remove bullets if model adds them
+      .map(line => line.trim().replace(/^[-*•]\s*/, '')) 
       .filter(line => line.length > 0)
-      .slice(0, 3); // Ensure max 3
+      .slice(0, 3); 
     
     // Extract sources from grounding metadata
     const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
@@ -206,7 +216,6 @@ export const runSimulation = async (
 
   const isBaseline = scenario === "BASELINE_PREDICTION";
   
-  // Prefer manual ticker if provided, otherwise fallback to analysis ticker
   const effectiveTicker = manualTicker || currentAnalysis.ticker || "Unknown Asset";
 
   const prompt = `
@@ -259,7 +268,7 @@ export const runSimulation = async (
 
     const text = response.text;
     if (!text) throw new Error("Oracle failed to respond.");
-    return JSON.parse(text) as SimulationResult;
+    return JSON.parse(cleanJsonString(text)) as SimulationResult;
   } catch (error) {
     console.error("Simulation failed:", error);
     throw error;
@@ -319,7 +328,7 @@ export const calculateBacktestScore = async (
     const text = response.text;
     if (!text) throw new Error("Backtester failed to respond.");
     
-    const result = JSON.parse(text);
+    const result = JSON.parse(cleanJsonString(text));
     return {
       score: result.score,
       critique: result.critique,
