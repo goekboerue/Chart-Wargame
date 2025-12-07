@@ -37,10 +37,12 @@ const getClient = () => {
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
- * Executes an API call with smart retries for Rate Limits (429).
- * Uses Exponential Backoff: Waits 2s, then 4s, then 8s before failing.
+ * HEAVY DUTY RETRY MECHANISM
+ * Designed to survive severe API congestion (429 Errors).
+ * Strategy: Linear Backoff + Jitter to prevent thundering herd.
+ * Max Wait Time: ~2-3 minutes total before giving up.
  */
-async function callWithRetry<T>(fn: () => Promise<T>, retries = 3, delay = 2000, context = "API Call"): Promise<T> {
+async function callWithRetry<T>(fn: () => Promise<T>, retries = 10, delay = 5000, context = "API Call"): Promise<T> {
   try {
     return await fn();
   } catch (error: any) {
@@ -49,10 +51,14 @@ async function callWithRetry<T>(fn: () => Promise<T>, retries = 3, delay = 2000,
     const isRateLimit = status === 429 || msg.includes("429") || msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED");
 
     if (isRateLimit && retries > 0) {
-      console.warn(`⚠️ ${context} hit Rate Limit (429). Cooling down for ${delay}ms... (Attempts left: ${retries})`);
-      await wait(delay);
-      // Retry with double the delay
-      return callWithRetry(fn, retries - 1, delay * 2, context);
+      // Add a small random jitter (0-1000ms) to help unblock race conditions
+      const jitter = Math.floor(Math.random() * 1000); 
+      const nextDelay = delay + 2000 + jitter; // Linear increase: 5s, 7s, 9s... to avoid excessively long waits
+      
+      console.warn(`⚠️ ${context} Rate Limit Hit. Cooling down for ${Math.round(nextDelay/1000)}s... (Retries left: ${retries})`);
+      
+      await wait(nextDelay);
+      return callWithRetry(fn, retries - 1, nextDelay, context);
     }
 
     // If strictly an API Key error, fail fast
@@ -60,9 +66,9 @@ async function callWithRetry<T>(fn: () => Promise<T>, retries = 3, delay = 2000,
       throw new Error("⚠️ AUTH FAILURE: Invalid or Missing API Key.");
     }
 
-    // If out of retries or other error, throw
+    // If out of retries
     if (isRateLimit) {
-       throw new Error(`⚠️ SYSTEM OVERLOAD: Maximum retries exceeded. The network is too congested. Please wait 1-2 minutes.`);
+       throw new Error(`⚠️ NETWORK JAMMED: The API is extremely busy. Please wait 2 minutes and try again.`);
     }
 
     throw error;
@@ -161,7 +167,7 @@ export const analyzeChart = async (imageBase64: string): Promise<ChartAnalysis> 
     const text = response.text;
     if (!text) throw new Error("Observer failed to respond.");
     return JSON.parse(cleanJsonString(text)) as ChartAnalysis;
-  }, 3, 2500, "Chart Analysis"); 
+  }, 10, 5000, "Chart Analysis"); // 10 Retries, start at 5s
 };
 
 export const fetchMarketContext = async (ticker: string, technicalContext?: string): Promise<MarketData> => {
@@ -179,37 +185,38 @@ export const fetchMarketContext = async (ticker: string, technicalContext?: stri
   `;
 
   try {
-    // We do NOT use the heavy retry logic here to save quota if it fails. 
-    // Market data is optional.
-    const response = await client.models.generateContent({
-      model: MODEL_NAME,
-      contents: prompt,
-      config: { tools: [{ googleSearch: {} }] },
-    });
+    // Market data is optional/auxiliary, so we use fewer retries to save quota for the main simulation
+    return await callWithRetry(async () => {
+        const response = await client.models.generateContent({
+        model: MODEL_NAME,
+        contents: prompt,
+        config: { tools: [{ googleSearch: {} }] },
+        });
 
-    const fullText = response.text || "No market data found.";
-    const parts = fullText.split("---HEADLINES---");
-    const summary = parts[0] ? parts[0].trim() : "Market data unavailable.";
-    const headlinesRaw = parts[1] || "";
-    
-    const headlines = headlinesRaw
-      .split('\n')
-      .map(line => line.trim().replace(/^[-*•]\s*/, '')) 
-      .filter(line => line.length > 0)
-      .slice(0, 3); 
-    
-    const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-    const sources = chunks
-      .map((chunk: any) => chunk.web)
-      .filter((web: any) => web?.uri && web?.title)
-      .map((web: any) => ({ title: web.title, uri: web.uri }));
+        const fullText = response.text || "No market data found.";
+        const parts = fullText.split("---HEADLINES---");
+        const summary = parts[0] ? parts[0].trim() : "Market data unavailable.";
+        const headlinesRaw = parts[1] || "";
+        
+        const headlines = headlinesRaw
+        .split('\n')
+        .map(line => line.trim().replace(/^[-*•]\s*/, '')) 
+        .filter(line => line.length > 0)
+        .slice(0, 3); 
+        
+        const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+        const sources = chunks
+        .map((chunk: any) => chunk.web)
+        .filter((web: any) => web?.uri && web?.title)
+        .map((web: any) => ({ title: web.title, uri: web.uri }));
 
-    return { summary, headlines, sources };
+        return { summary, headlines, sources };
+    }, 2, 5000, "Market Intel"); // Only 2 retries for news to avoid wasting time
+    
   } catch (error: any) {
     console.warn("Scout failed:", error);
-    // Graceful fallback for rate limits on this specific optional call
     if (error?.status === 429 || error?.message?.includes("429")) {
-        return { summary: "⚠️ Intel Network Congested (Rate Limit)", headlines: ["Try refreshing news manually in 30s."], sources: [] };
+        return { summary: "⚠️ Intel Network Congested (Rate Limit)", headlines: ["Try refreshing news manually later."], sources: [] };
     }
     return { summary: "Market data unavailable.", headlines: [], sources: [] };
   }
@@ -255,7 +262,7 @@ export const runSimulation = async (
     const text = response.text;
     if (!text) throw new Error("Oracle failed to respond.");
     return JSON.parse(cleanJsonString(text)) as SimulationResult;
-  }, 3, 3000, "Simulation Oracle");
+  }, 10, 5000, "Simulation Oracle"); // 10 Retries
 };
 
 export const calculateBacktestScore = async (
@@ -299,5 +306,5 @@ export const calculateBacktestScore = async (
       critique: result.critique,
       timestamp: Date.now()
     };
-  }, 3, 3000, "Backtest Judge");
+  }, 10, 5000, "Backtest Judge");
 };
