@@ -5,9 +5,10 @@ import { MODEL_NAME } from "../constants";
 const getClient = () => {
   const apiKey = process.env.API_KEY;
   if (!apiKey) {
-    throw new Error("API Key not found in environment variables");
+    console.error("API Key is missing. Check your environment variables.");
+    // We don't throw here immediately to allow the UI to render the error state gracefully if possible
   }
-  return new GoogleGenAI({ apiKey });
+  return new GoogleGenAI({ apiKey: apiKey || "" });
 };
 
 // Schema for Step 1: Observer
@@ -147,6 +148,8 @@ export const fetchMarketContext = async (ticker: string, technicalContext?: stri
   2. Find the **TOP 3 most relevant and recent news headlines** affecting ${ticker}. 
      * **CRITICAL:** Ensure the news is SPECIFICALLY about ${ticker}. Do not return news for other assets or general country news unless directly relevant.
      * Prioritize news that explains the specific technical pattern mentioned in the CONTEXT.
+     * If the chart context is "Bearish" or "Downtrend", look for negative catalysts (e.g., Bad earnings, lawsuit, CEO resigns).
+     * If the chart context is "Bullish", look for positive catalysts.
   
   **OUTPUT FORMAT:**
   Provide a short 1-sentence summary of the current sentiment (Bullish/Bearish).
