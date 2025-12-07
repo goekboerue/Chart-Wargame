@@ -7,6 +7,7 @@ export interface GhostCandle {
 }
 
 export interface ChartAnalysis {
+  ticker?: string;
   technical_summary: string;
   trend: string;
   support_resistance: string;

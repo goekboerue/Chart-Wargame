@@ -14,6 +14,10 @@ const getClient = () => {
 const ANALYSIS_SCHEMA: Schema = {
   type: Type.OBJECT,
   properties: {
+    ticker: {
+      type: Type.STRING,
+      description: "The EXACT stock/crypto ticker symbol visible on the chart (e.g., 'AAPL', 'BTCUSDT', 'XAUUSD'). Look at the top-left or watermarks. If uncertain or text is blurry, return null.",
+    },
     technical_summary: {
       type: Type.STRING,
       description: "A comprehensive technical analysis summary (approx 3-4 sentences). Explain the market structure, momentum, and the 'Why' behind the current setup. Avoid overly robotic phrasing.",
@@ -90,16 +94,15 @@ export const analyzeChart = async (imageBase64: string): Promise<ChartAnalysis> 
   
   **TASK:**
   Analyze the uploaded financial chart image. 
-  1. Identify the primary Trend.
-  2. Locate key Support and Resistance levels. 
+  1. **IDENTIFY TICKER:** Inspect the image carefully for the asset symbol (e.g., BTC, ETH, TSLA, GARAN). It is usually in the top-left corner. **If you cannot find a clear ticker, return NULL for the ticker field.** Do NOT guess a country or random word.
+  2. Identify the primary Trend.
+  3. Locate key Support and Resistance levels. 
      * Identify the numeric values for plotting.
-     * write a DESCRIPTIVE sentence about these levels (e.g., mention if it's a historical high, a psychological level, or a moving average support).
-  3. Identify any visible chart patterns (Flag, Head & Shoulders, etc.).
-  4. Provide a technical summary. 
-     * Do NOT be overly brief. 
+     * write a DESCRIPTIVE sentence about these levels.
+  4. Identify any visible chart patterns.
+  5. Provide a technical summary. 
      * Explain the narrative of the chart. 
      * What are the buyers and sellers doing? 
-     * Is volume confirming the move? (if visible)
   
   Return the analysis in JSON format.
   `;
@@ -116,7 +119,7 @@ export const analyzeChart = async (imageBase64: string): Promise<ChartAnalysis> 
       config: {
         responseMimeType: "application/json",
         responseSchema: ANALYSIS_SCHEMA,
-        temperature: 0.3, // Slightly higher temp for better descriptions
+        temperature: 0.2, // Lower temperature for more accurate extraction
       },
     });
 
@@ -130,15 +133,25 @@ export const analyzeChart = async (imageBase64: string): Promise<ChartAnalysis> 
 };
 
 // New Service: The Scout (Search Grounding)
-export const fetchMarketContext = async (ticker: string): Promise<MarketData> => {
+export const fetchMarketContext = async (ticker: string, technicalContext?: string): Promise<MarketData> => {
   const client = getClient();
   
   const prompt = `
-  Search for the current live price, today's percentage change, and the top 3 relevant news headlines for ${ticker}. 
+  You are a financial news scout. Search for the latest market data for the asset: "${ticker}".
   
-  Provide a concise summary of the price action and market sentiment.
+  **CONTEXT:**
+  The technical chart currently shows: "${technicalContext || 'General Analysis'}".
+  
+  **TASKS:**
+  1. Find the current live price and today's percentage change for ${ticker}.
+  2. Find the **TOP 3 most relevant and recent news headlines** affecting ${ticker}. 
+     * **CRITICAL:** Ensure the news is SPECIFICALLY about ${ticker}. Do not return news for other assets or general country news unless directly relevant.
+     * Prioritize news that explains the specific technical pattern mentioned in the CONTEXT.
+  
+  **OUTPUT FORMAT:**
+  Provide a short 1-sentence summary of the current sentiment (Bullish/Bearish).
   Then, strictly output the delimiter "---HEADLINES---" on a new line.
-  Then, list the top 3 news headlines, one per line (do not use bullet points, just the text).
+  Then, list the top 3 headlines. Plain text, one per line. No numbers, no bullets, no dashes.
   `;
 
   try {
@@ -147,7 +160,7 @@ export const fetchMarketContext = async (ticker: string): Promise<MarketData> =>
       contents: prompt,
       config: {
         tools: [{ googleSearch: {} }],
-        // responseSchema is NOT allowed with googleSearch
+        // responseSchema is NOT allowed with googleSearch, we must parse text.
       },
     });
 
@@ -155,13 +168,14 @@ export const fetchMarketContext = async (ticker: string): Promise<MarketData> =>
     
     // Parse text to extract summary and headlines
     const parts = fullText.split("---HEADLINES---");
-    const summary = parts[0].trim();
+    const summary = parts[0] ? parts[0].trim() : "Market data unavailable.";
     const headlinesRaw = parts[1] || "";
     
     const headlines = headlinesRaw
       .split('\n')
       .map(line => line.trim().replace(/^[-*•]\s*/, '')) // Remove bullets if model adds them
-      .filter(line => line.length > 0);
+      .filter(line => line.length > 0)
+      .slice(0, 3); // Ensure max 3
     
     // Extract sources from grounding metadata
     const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
@@ -181,17 +195,22 @@ export const runSimulation = async (
   imageBase64: string,
   currentAnalysis: ChartAnalysis,
   scenario: string,
-  marketData?: MarketData
+  marketData?: MarketData,
+  manualTicker?: string
 ): Promise<SimulationResult> => {
   const client = getClient();
   const base64Data = imageBase64.split(',')[1] || imageBase64;
 
   const isBaseline = scenario === "BASELINE_PREDICTION";
+  
+  // Prefer manual ticker if provided, otherwise fallback to analysis ticker
+  const effectiveTicker = manualTicker || currentAnalysis.ticker || "Unknown Asset";
 
   const prompt = `
   **ROLE:** Financial Oracle & Simulator.
 
   **CONTEXT (The Observer's Analysis):**
+  Ticker: ${effectiveTicker}
   Trend: ${currentAnalysis.trend}
   Levels Description: ${currentAnalysis.support_resistance}
   Numeric Levels: Support ~${currentAnalysis.key_levels?.support}, Resistance ~${currentAnalysis.key_levels?.resistance}
@@ -211,7 +230,7 @@ export const runSimulation = async (
   }
 
   **TASK:**
-  1. Simulate the price action. ${isBaseline ? "Focus on the immediate market reaction to the news." : "Focus on the impact of the specific scenario."}
+  1. Simulate the price action for ${effectiveTicker}.
   2. Generate 10 "Ghost Candles".
      * IMPORTANT: The first candle's OPEN must be realistic relative to the last visible candle in the image.
      * Respect the Support (${currentAnalysis.key_levels?.support}) and Resistance (${currentAnalysis.key_levels?.resistance}) levels unless the news/scenario is strong enough to break them.
