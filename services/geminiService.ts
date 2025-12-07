@@ -11,10 +11,10 @@ declare var process: {
 };
 
 const getApiKey = (): string => {
-  // 1. Try standard process.env (Node/Bundler replaced)
+  // 1. Try the injected process.env from vite.config.ts (Most reliable now)
   if (process.env.API_KEY) return process.env.API_KEY;
 
-  // 2. Try Vite-specific import.meta.env (Client-side)
+  // 2. Fallback to Vite-specific import.meta.env
   try {
     // @ts-ignore
     const viteEnv = import.meta.env;
@@ -22,7 +22,7 @@ const getApiKey = (): string => {
       return viteEnv.VITE_API_KEY || viteEnv.API_KEY || "";
     }
   } catch (e) {
-    // Ignore if import.meta is not defined
+    // Ignore
   }
 
   return "";
@@ -30,8 +30,9 @@ const getApiKey = (): string => {
 
 const getClient = () => {
   const apiKey = getApiKey();
+  // Remove the hard error throw here to prevent app crash loop, log warning instead
   if (!apiKey) {
-    console.error("CRITICAL: API Key is missing. Ensure API_KEY or VITE_API_KEY is set in your environment.");
+    console.warn("API Key is missing. Simulation will likely fail.");
   }
   return new GoogleGenAI({ apiKey: apiKey });
 };
