@@ -166,25 +166,33 @@ export const analyzeChart = async (imageBase64: string): Promise<ChartAnalysis> 
 
 export const fetchMarketContext = async (ticker: string, technicalContext?: string): Promise<MarketData> => {
   const client = getClient();
+  const today = new Date().toDateString();
   
   const prompt = `
-  You are a financial news scout. Search for the latest market data for the asset: "${ticker}".
+  **CURRENT DATE:** ${today}
+
+  You are a high-frequency financial news scout. Search for the **ABSOLUTE LATEST** market data for the asset: "${ticker}".
+  
+  **STRICT TIME FILTER:**
+  - **IGNORE** any news older than 7 days. Even if it is relevant, if it is old, DO NOT USE IT.
+  - **PRIORITY:** Focus on news from the LAST 24 to 48 HOURS.
+  - If no recent news is found, clearly state "No significant news in the last 7 days" instead of returning old data.
   
   **CONTEXT:**
   The technical chart currently shows: "${technicalContext || 'General Analysis'}".
   
   **TASKS:**
   1. Find the current live price and today's percentage change for ${ticker}.
-  2. Find the **TOP 3 most relevant and recent news headlines** affecting ${ticker}. 
-     * **CRITICAL:** Ensure the news is SPECIFICALLY about ${ticker}. Do not return news for other assets or general country news unless directly relevant.
-     * Prioritize news that explains the specific technical pattern mentioned in the CONTEXT.
-     * If the chart context is "Bearish" or "Downtrend", look for negative catalysts (e.g., Bad earnings, lawsuit, CEO resigns).
-     * If the chart context is "Bullish", look for positive catalysts.
+  2. Find the **TOP 3 most relevant and FRESH headlines** affecting ${ticker}. 
+     * **CRITICAL:** Ensure the news is SPECIFICALLY about ${ticker}.
+     * If the chart context is "Bearish", look for recent negative catalysts (e.g., Bad earnings, lawsuit, CEO resigns).
+     * If the chart context is "Bullish", look for recent positive catalysts.
   
   **OUTPUT FORMAT:**
   Provide a short 1-sentence summary of the current sentiment (Bullish/Bearish).
   Then, strictly output the delimiter "---HEADLINES---" on a new line.
-  Then, list the top 3 headlines. Plain text, one per line. No numbers, no bullets, no dashes.
+  Then, list the top 3 headlines. Plain text, one per line. No numbers, no bullets, no dashes. 
+  *IMPORTANT:* Include the relative time in parentheses if possible (e.g. "Earnings report released (2 hours ago)").
   `;
 
   try {
