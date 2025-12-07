@@ -36,13 +36,19 @@ const getClient = () => {
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+type StatusCallback = (msg: string) => void;
+
 /**
- * HEAVY DUTY RETRY MECHANISM
- * Designed to survive severe API congestion (429 Errors).
- * Strategy: Linear Backoff + Jitter to prevent thundering herd.
- * Max Wait Time: ~2-3 minutes total before giving up.
+ * HEAVY DUTY RETRY MECHANISM WITH FEEDBACK
+ * Now reports status back to the UI so the user knows it's not frozen.
  */
-async function callWithRetry<T>(fn: () => Promise<T>, retries = 10, delay = 5000, context = "API Call"): Promise<T> {
+async function callWithRetry<T>(
+  fn: () => Promise<T>, 
+  retries = 5, 
+  delay = 4000, 
+  context = "API Call",
+  onUpdate?: StatusCallback
+): Promise<T> {
   try {
     return await fn();
   } catch (error: any) {
@@ -51,31 +57,36 @@ async function callWithRetry<T>(fn: () => Promise<T>, retries = 10, delay = 5000
     const isRateLimit = status === 429 || msg.includes("429") || msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED");
 
     if (isRateLimit && retries > 0) {
-      // Add a small random jitter (0-1000ms) to help unblock race conditions
+      // Add a small random jitter
       const jitter = Math.floor(Math.random() * 1000); 
-      const nextDelay = delay + 2000 + jitter; // Linear increase: 5s, 7s, 9s... to avoid excessively long waits
+      const nextDelay = delay + 2000 + jitter; // Linear increase
+      const delaySec = Math.ceil(nextDelay / 1000);
+
+      const statusMsg = `⚠️ SYSTEM OVERHEAT (429). COOLING DOWN... ${delaySec}s`;
+      console.warn(statusMsg);
       
-      console.warn(`⚠️ ${context} Rate Limit Hit. Cooling down for ${Math.round(nextDelay/1000)}s... (Retries left: ${retries})`);
+      if (onUpdate) onUpdate(statusMsg);
       
       await wait(nextDelay);
-      return callWithRetry(fn, retries - 1, nextDelay, context);
+      
+      if (onUpdate) onUpdate(`> RE-ENGAGING ${context.toUpperCase()}... (ATTEMPT ${6 - retries}/5)`);
+      
+      return callWithRetry(fn, retries - 1, nextDelay, context, onUpdate);
     }
 
-    // If strictly an API Key error, fail fast
     if (msg.includes("API Key")) {
       throw new Error("⚠️ AUTH FAILURE: Invalid or Missing API Key.");
     }
 
-    // If out of retries
     if (isRateLimit) {
-       throw new Error(`⚠️ NETWORK JAMMED: The API is extremely busy. Please wait 2 minutes and try again.`);
+       throw new Error(`⚠️ SYSTEM FAILURE: Network congestion is too high. Try again in 2 minutes.`);
     }
 
     throw error;
   }
 }
 
-// Helper to clean JSON string from Markdown code blocks
+// Helper to clean JSON string
 const cleanJsonString = (text: string): string => {
   return text.replace(/```json|```/g, '').trim();
 };
@@ -134,7 +145,7 @@ const BACKTEST_SCHEMA: Schema = {
 
 // --- API FUNCTIONS ---
 
-export const analyzeChart = async (imageBase64: string): Promise<ChartAnalysis> => {
+export const analyzeChart = async (imageBase64: string, onUpdate?: StatusCallback): Promise<ChartAnalysis> => {
   const client = getClient();
   const base64Data = imageBase64.split(',')[1] || imageBase64;
 
@@ -167,10 +178,10 @@ export const analyzeChart = async (imageBase64: string): Promise<ChartAnalysis> 
     const text = response.text;
     if (!text) throw new Error("Observer failed to respond.");
     return JSON.parse(cleanJsonString(text)) as ChartAnalysis;
-  }, 10, 5000, "Chart Analysis"); // 10 Retries, start at 5s
+  }, 5, 4000, "Chart Analysis", onUpdate);
 };
 
-export const fetchMarketContext = async (ticker: string, technicalContext?: string): Promise<MarketData> => {
+export const fetchMarketContext = async (ticker: string, technicalContext?: string, onUpdate?: StatusCallback): Promise<MarketData> => {
   const client = getClient();
   const today = new Date().toDateString();
   
@@ -185,7 +196,6 @@ export const fetchMarketContext = async (ticker: string, technicalContext?: stri
   `;
 
   try {
-    // Market data is optional/auxiliary, so we use fewer retries to save quota for the main simulation
     return await callWithRetry(async () => {
         const response = await client.models.generateContent({
         model: MODEL_NAME,
@@ -211,7 +221,7 @@ export const fetchMarketContext = async (ticker: string, technicalContext?: stri
         .map((web: any) => ({ title: web.title, uri: web.uri }));
 
         return { summary, headlines, sources };
-    }, 2, 5000, "Market Intel"); // Only 2 retries for news to avoid wasting time
+    }, 2, 4000, "Market Intel", onUpdate);
     
   } catch (error: any) {
     console.warn("Scout failed:", error);
@@ -227,7 +237,8 @@ export const runSimulation = async (
   currentAnalysis: ChartAnalysis,
   scenario: string,
   marketData?: MarketData,
-  manualTicker?: string
+  manualTicker?: string,
+  onUpdate?: StatusCallback
 ): Promise<SimulationResult> => {
   const client = getClient();
   const base64Data = imageBase64.split(',')[1] || imageBase64;
@@ -262,13 +273,14 @@ export const runSimulation = async (
     const text = response.text;
     if (!text) throw new Error("Oracle failed to respond.");
     return JSON.parse(cleanJsonString(text)) as SimulationResult;
-  }, 10, 5000, "Simulation Oracle"); // 10 Retries
+  }, 5, 4000, "Simulation Oracle", onUpdate);
 };
 
 export const calculateBacktestScore = async (
   predictedCandles: GhostCandle[],
   resultImageBase64: string,
-  scenario: string
+  scenario: string,
+  onUpdate?: StatusCallback
 ): Promise<BacktestResult> => {
   const client = getClient();
   const base64Data = resultImageBase64.split(',')[1] || resultImageBase64;
@@ -306,5 +318,5 @@ export const calculateBacktestScore = async (
       critique: result.critique,
       timestamp: Date.now()
     };
-  }, 10, 5000, "Backtest Judge");
+  }, 5, 4000, "Backtest Judge", onUpdate);
 };
