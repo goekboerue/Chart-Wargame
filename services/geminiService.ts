@@ -11,10 +11,7 @@ declare var process: {
 };
 
 const getApiKey = (): string => {
-  // 1. Try the injected process.env from vite.config.ts (Most reliable now)
   if (process.env.API_KEY) return process.env.API_KEY;
-
-  // 2. Fallback to Vite-specific import.meta.env
   try {
     // @ts-ignore
     const viteEnv = import.meta.env;
@@ -24,63 +21,73 @@ const getApiKey = (): string => {
   } catch (e) {
     // Ignore
   }
-
   return "";
 };
 
 const getClient = () => {
   const apiKey = getApiKey();
-  // Remove the hard error throw here to prevent app crash loop, log warning instead
   if (!apiKey) {
     console.warn("API Key is missing. Simulation will likely fail.");
   }
   return new GoogleGenAI({ apiKey: apiKey });
 };
 
-// Helper to handle API errors specifically for Rate Limits
-const handleApiError = (error: any, context: string): never => {
-  console.error(`${context} failed:`, error);
-  
-  const msg = error?.message || "";
-  const status = error?.status;
+// --- UTILITIES FOR RATE LIMIT HANDLING ---
 
-  if (status === 429 || msg.includes("429") || msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED")) {
-    throw new Error("⚠️ SYSTEM OVERHEAT: API Quota Exceeded. Please wait 60 seconds before re-engaging.");
+const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Executes an API call with smart retries for Rate Limits (429).
+ * Uses Exponential Backoff: Waits 2s, then 4s, then 8s before failing.
+ */
+async function callWithRetry<T>(fn: () => Promise<T>, retries = 3, delay = 2000, context = "API Call"): Promise<T> {
+  try {
+    return await fn();
+  } catch (error: any) {
+    const msg = error?.message || "";
+    const status = error?.status;
+    const isRateLimit = status === 429 || msg.includes("429") || msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED");
+
+    if (isRateLimit && retries > 0) {
+      console.warn(`⚠️ ${context} hit Rate Limit (429). Cooling down for ${delay}ms... (Attempts left: ${retries})`);
+      await wait(delay);
+      // Retry with double the delay
+      return callWithRetry(fn, retries - 1, delay * 2, context);
+    }
+
+    // If strictly an API Key error, fail fast
+    if (msg.includes("API Key")) {
+      throw new Error("⚠️ AUTH FAILURE: Invalid or Missing API Key.");
+    }
+
+    // If out of retries or other error, throw
+    if (isRateLimit) {
+       throw new Error(`⚠️ SYSTEM OVERLOAD: Maximum retries exceeded. The network is too congested. Please wait 1-2 minutes.`);
+    }
+
+    throw error;
   }
+}
 
-  if (msg.includes("API Key")) {
-     throw new Error("⚠️ AUTH FAILURE: Invalid or Missing API Key.");
-  }
-
-  throw new Error(`${context} FAILED: ${msg.slice(0, 50)}...`);
+// Helper to clean JSON string from Markdown code blocks
+const cleanJsonString = (text: string): string => {
+  return text.replace(/```json|```/g, '').trim();
 };
 
-// Schema for Step 1: Observer
+// --- SCHEMAS ---
+
 const ANALYSIS_SCHEMA: Schema = {
   type: Type.OBJECT,
   properties: {
-    ticker: {
-      type: Type.STRING,
-      description: "The EXACT stock/crypto ticker symbol visible on the chart (e.g., 'AAPL', 'BTCUSDT', 'XAUUSD'). Look at the top-left or watermarks. If uncertain or text is blurry, return null.",
-    },
-    technical_summary: {
-      type: Type.STRING,
-      description: "A comprehensive technical analysis summary (approx 3-4 sentences). Explain the market structure, momentum, and the 'Why' behind the current setup. Avoid overly robotic phrasing.",
-    },
-    trend: {
-      type: Type.STRING,
-      description: "Current trend direction (e.g., 'Strong Bullish Trend', 'Consolidation Phase') including nuance.",
-    },
-    support_resistance: {
-      type: Type.STRING,
-      description: "A descriptive sentence explaining the key zones. (e.g., 'Major psychological support holds firmly at $150, while the $180 supply zone remains untested.').",
-    },
+    ticker: { type: Type.STRING },
+    technical_summary: { type: Type.STRING },
+    trend: { type: Type.STRING },
+    support_resistance: { type: Type.STRING },
     key_levels: {
       type: Type.OBJECT,
-      description: "Estimated numeric values for plotting.",
       properties: {
-        support: { type: Type.NUMBER, description: "The nearest significant support price level." },
-        resistance: { type: Type.NUMBER, description: "The nearest significant resistance price level." }
+        support: { type: Type.NUMBER },
+        resistance: { type: Type.NUMBER }
       },
       required: ["support", "resistance"]
     }
@@ -88,14 +95,10 @@ const ANALYSIS_SCHEMA: Schema = {
   required: ["technical_summary", "trend", "support_resistance", "key_levels"],
 };
 
-// Schema for Step 3: Oracle
 const SIMULATION_SCHEMA: Schema = {
   type: Type.OBJECT,
   properties: {
-    analysis: {
-      type: Type.STRING,
-      description: "Strategic reasoning of how the specific scenario and real-time data impact the chart.",
-    },
+    analysis: { type: Type.STRING },
     ghost_candles: {
       type: Type.ARRAY,
       items: {
@@ -114,26 +117,16 @@ const SIMULATION_SCHEMA: Schema = {
   required: ["analysis", "ghost_candles"],
 };
 
-// Schema for Step 4: Backtester (The Judge)
 const BACKTEST_SCHEMA: Schema = {
   type: Type.OBJECT,
   properties: {
-    score: {
-      type: Type.NUMBER,
-      description: "Accuracy score from 0 to 100 based on direction, volatility, and levels.",
-    },
-    critique: {
-      type: Type.STRING,
-      description: "A harsh, concise evaluation of why the prediction was right or wrong compared to the actual result image.",
-    }
+    score: { type: Type.NUMBER },
+    critique: { type: Type.STRING }
   },
   required: ["score", "critique"],
 };
 
-// Helper to clean JSON string from Markdown code blocks
-const cleanJsonString = (text: string): string => {
-  return text.replace(/```json|```/g, '').trim();
-};
+// --- API FUNCTIONS ---
 
 export const analyzeChart = async (imageBase64: string): Promise<ChartAnalysis> => {
   const client = getClient();
@@ -141,23 +134,15 @@ export const analyzeChart = async (imageBase64: string): Promise<ChartAnalysis> 
 
   const prompt = `
   **ROLE:** Expert Technical Analyst (The Observer).
-  
-  **TASK:**
-  Analyze the uploaded financial chart image. 
-  1. **IDENTIFY TICKER:** Inspect the image carefully for the asset symbol (e.g., BTC, ETH, TSLA, GARAN). It is usually in the top-left corner. **If you cannot find a clear ticker, return NULL for the ticker field.** Do NOT guess a country or random word.
-  2. Identify the primary Trend.
-  3. Locate key Support and Resistance levels. 
-     * Identify the numeric values for plotting.
-     * write a DESCRIPTIVE sentence about these levels.
-  4. Identify any visible chart patterns.
-  5. Provide a technical summary. 
-     * Explain the narrative of the chart. 
-     * What are the buyers and sellers doing? 
-  
-  Return the analysis in JSON format.
+  **TASK:** Analyze financial chart.
+  1. IDENTIFY TICKER (e.g. BTC, TSLA). If unclear, return NULL.
+  2. Identify Trend.
+  3. Key Support/Resistance levels (numeric & descriptive).
+  4. Technical Summary (Narrative of buyers/sellers).
+  Return JSON.
   `;
 
-  try {
+  return callWithRetry(async () => {
     const response = await client.models.generateContent({
       model: MODEL_NAME,
       contents: {
@@ -176,9 +161,7 @@ export const analyzeChart = async (imageBase64: string): Promise<ChartAnalysis> 
     const text = response.text;
     if (!text) throw new Error("Observer failed to respond.");
     return JSON.parse(cleanJsonString(text)) as ChartAnalysis;
-  } catch (error) {
-    return handleApiError(error, "Observer Analysis");
-  }
+  }, 3, 2500, "Chart Analysis"); 
 };
 
 export const fetchMarketContext = async (ticker: string, technicalContext?: string): Promise<MarketData> => {
@@ -186,44 +169,25 @@ export const fetchMarketContext = async (ticker: string, technicalContext?: stri
   const today = new Date().toDateString();
   
   const prompt = `
-  **CURRENT DATE:** ${today}
-
-  You are a high-frequency financial news scout. Search for the **ABSOLUTE LATEST** market data for the asset: "${ticker}".
-  
-  **STRICT TIME FILTER:**
-  - **IGNORE** any news older than 7 days. Even if it is relevant, if it is old, DO NOT USE IT.
-  - **PRIORITY:** Focus on news from the LAST 24 to 48 HOURS.
-  - If no recent news is found, clearly state "No significant news in the last 7 days" instead of returning old data.
-  
-  **CONTEXT:**
-  The technical chart currently shows: "${technicalContext || 'General Analysis'}".
-  
-  **TASKS:**
-  1. Find the current live price and today's percentage change for ${ticker}.
-  2. Find the **TOP 3 most relevant and FRESH headlines** affecting ${ticker}. 
-     * **CRITICAL:** Ensure the news is SPECIFICALLY about ${ticker}.
-     * If the chart context is "Bearish", look for recent negative catalysts (e.g., Bad earnings, lawsuit, CEO resigns).
-     * If the chart context is "Bullish", look for recent positive catalysts.
-  
-  **OUTPUT FORMAT:**
-  Provide a short 1-sentence summary of the current sentiment (Bullish/Bearish).
-  Then, strictly output the delimiter "---HEADLINES---" on a new line.
-  Then, list the top 3 headlines. Plain text, one per line. No numbers, no bullets, no dashes. 
-  *IMPORTANT:* Include the relative time in parentheses if possible (e.g. "Earnings report released (2 hours ago)").
+  **DATE:** ${today}. Ticker: "${ticker}".
+  Find ABSOLUTE LATEST market news (Last 24-48h preferred, Max 7 days).
+  Context: "${technicalContext || ''}".
+  Tasks:
+  1. Live price & % change.
+  2. Top 3 FRESH headlines.
+  Output: Summary sentence. Then "---HEADLINES---". Then list 3 headlines.
   `;
 
   try {
+    // We do NOT use the heavy retry logic here to save quota if it fails. 
+    // Market data is optional.
     const response = await client.models.generateContent({
       model: MODEL_NAME,
       contents: prompt,
-      config: {
-        tools: [{ googleSearch: {} }],
-      },
+      config: { tools: [{ googleSearch: {} }] },
     });
 
     const fullText = response.text || "No market data found.";
-    
-    // Parse text to extract summary and headlines
     const parts = fullText.split("---HEADLINES---");
     const summary = parts[0] ? parts[0].trim() : "Market data unavailable.";
     const headlinesRaw = parts[1] || "";
@@ -234,7 +198,6 @@ export const fetchMarketContext = async (ticker: string, technicalContext?: stri
       .filter(line => line.length > 0)
       .slice(0, 3); 
     
-    // Extract sources from grounding metadata
     const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
     const sources = chunks
       .map((chunk: any) => chunk.web)
@@ -242,11 +205,11 @@ export const fetchMarketContext = async (ticker: string, technicalContext?: stri
       .map((web: any) => ({ title: web.title, uri: web.uri }));
 
     return { summary, headlines, sources };
-  } catch (error) {
-    // If search fails due to quota, we can return empty data rather than crashing the whole flow if called optionally
-    console.warn("Market context fetch failed or quota hit.", error);
-    if ((error as any)?.status === 429) {
-        return { summary: "⚠️ INTEL UNAVAILABLE (RATE LIMIT).", headlines: ["System cooling down..."], sources: [] };
+  } catch (error: any) {
+    console.warn("Scout failed:", error);
+    // Graceful fallback for rate limits on this specific optional call
+    if (error?.status === 429 || error?.message?.includes("429")) {
+        return { summary: "⚠️ Intel Network Congested (Rate Limit)", headlines: ["Try refreshing news manually in 30s."], sources: [] };
     }
     return { summary: "Market data unavailable.", headlines: [], sources: [] };
   }
@@ -261,44 +224,19 @@ export const runSimulation = async (
 ): Promise<SimulationResult> => {
   const client = getClient();
   const base64Data = imageBase64.split(',')[1] || imageBase64;
-
   const isBaseline = scenario === "BASELINE_PREDICTION";
-  
   const effectiveTicker = manualTicker || currentAnalysis.ticker || "Unknown Asset";
 
   const prompt = `
-  **ROLE:** Financial Oracle & Simulator.
-
-  **CONTEXT (The Observer's Analysis):**
-  Ticker: ${effectiveTicker}
-  Trend: ${currentAnalysis.trend}
-  Levels Description: ${currentAnalysis.support_resistance}
-  Numeric Levels: Support ~${currentAnalysis.key_levels?.support}, Resistance ~${currentAnalysis.key_levels?.resistance}
-  Summary: ${currentAnalysis.technical_summary}
-
-  ${marketData ? `
-  **REAL-TIME INTELLIGENCE (The Reality Check):**
-  Summary: "${marketData.summary}"
-  Headlines:
-  ${marketData.headlines.map(h => `- ${h}`).join('\n')}
-  ` : ''}
-
-  **SCENARIO:**
-  ${isBaseline 
-    ? "NO HYPOTHETICAL INJECTED. Analyze the interaction between the CHART TECHNICALS and the REAL-TIME NEWS. Predict the natural course of price action for the next 10 candles based on the current sentiment and momentum." 
-    : `"${scenario}"`
-  }
-
-  **TASK:**
-  1. Simulate the price action for ${effectiveTicker}.
-  2. Generate 10 "Ghost Candles".
-     * IMPORTANT: The first candle's OPEN must be realistic relative to the last visible candle in the image.
-     * Respect the Support (${currentAnalysis.key_levels?.support}) and Resistance (${currentAnalysis.key_levels?.resistance}) levels unless the news/scenario is strong enough to break them.
-
-  Return JSON with strategic reasoning and the candle data.
+  **ROLE:** Financial Oracle.
+  **CONTEXT:** ${effectiveTicker} | ${currentAnalysis.trend} | Levels: ${currentAnalysis.key_levels?.support}/${currentAnalysis.key_levels?.resistance}.
+  **NEWS:** ${marketData?.summary || "N/A"}
+  **SCENARIO:** ${isBaseline ? "Natural Projection (Next 10 candles)" : `"${scenario}"`}
+  **TASK:** Simulate 10 Ghost Candles. Open of 1st candle must align with chart end.
+  Return JSON.
   `;
 
-  try {
+  return callWithRetry(async () => {
     const response = await client.models.generateContent({
       model: MODEL_NAME,
       contents: {
@@ -317,9 +255,7 @@ export const runSimulation = async (
     const text = response.text;
     if (!text) throw new Error("Oracle failed to respond.");
     return JSON.parse(cleanJsonString(text)) as SimulationResult;
-  } catch (error) {
-    return handleApiError(error, "Simulation");
-  }
+  }, 3, 3000, "Simulation Oracle");
 };
 
 export const calculateBacktestScore = async (
@@ -331,32 +267,15 @@ export const calculateBacktestScore = async (
   const base64Data = resultImageBase64.split(',')[1] || resultImageBase64;
 
   const prompt = `
-  **ROLE:** The Judge (Backtest Auditor).
-
-  **TASK:**
-  Compare the provided PREDICTION DATA against the ACTUAL RESULT image.
-
-  **PREDICTION (Ghost Candles JSON):**
-  ${JSON.stringify(predictedCandles)}
-  
-  **SCENARIO CONTEXT:**
-  "${scenario}"
-
-  **ACTUAL RESULT:**
-  (See uploaded image)
-
-  **EVALUATION CRITERIA:**
-  1. **Direction:** Did the price move up/down as predicted?
-  2. **Magnitude:** Was the volatility similar?
-  3. **Structure:** Did it respect similar support/resistance levels?
-
-  **OUTPUT:**
-  Return a JSON object with:
-  - 'score' (0-100 integer)
-  - 'critique' (Short, sharp analysis of the difference. Max 2 sentences.)
+  **ROLE:** The Judge.
+  **PREDICTION:** ${JSON.stringify(predictedCandles)}
+  **SCENARIO:** "${scenario}"
+  **TASK:** Compare Prediction vs Actual Image.
+  Criteria: Direction, Magnitude, Levels.
+  Return JSON: {score (0-100), critique (max 2 sentences)}.
   `;
 
-  try {
+  return callWithRetry(async () => {
     const response = await client.models.generateContent({
       model: MODEL_NAME,
       contents: {
@@ -373,15 +292,12 @@ export const calculateBacktestScore = async (
     });
 
     const text = response.text;
-    if (!text) throw new Error("Backtester failed to respond.");
-    
+    if (!text) throw new Error("Judge failed to respond.");
     const result = JSON.parse(cleanJsonString(text));
     return {
       score: result.score,
       critique: result.critique,
       timestamp: Date.now()
     };
-  } catch (error) {
-    return handleApiError(error, "Backtest");
-  }
+  }, 3, 3000, "Backtest Judge");
 };
