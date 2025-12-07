@@ -37,6 +37,24 @@ const getClient = () => {
   return new GoogleGenAI({ apiKey: apiKey });
 };
 
+// Helper to handle API errors specifically for Rate Limits
+const handleApiError = (error: any, context: string): never => {
+  console.error(`${context} failed:`, error);
+  
+  const msg = error?.message || "";
+  const status = error?.status;
+
+  if (status === 429 || msg.includes("429") || msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED")) {
+    throw new Error("⚠️ SYSTEM OVERHEAT: API Quota Exceeded. Please wait 60 seconds before re-engaging.");
+  }
+
+  if (msg.includes("API Key")) {
+     throw new Error("⚠️ AUTH FAILURE: Invalid or Missing API Key.");
+  }
+
+  throw new Error(`${context} FAILED: ${msg.slice(0, 50)}...`);
+};
+
 // Schema for Step 1: Observer
 const ANALYSIS_SCHEMA: Schema = {
   type: Type.OBJECT,
@@ -159,8 +177,7 @@ export const analyzeChart = async (imageBase64: string): Promise<ChartAnalysis> 
     if (!text) throw new Error("Observer failed to respond.");
     return JSON.parse(cleanJsonString(text)) as ChartAnalysis;
   } catch (error) {
-    console.error("Analysis failed:", error);
-    throw error;
+    return handleApiError(error, "Observer Analysis");
   }
 };
 
@@ -226,7 +243,11 @@ export const fetchMarketContext = async (ticker: string, technicalContext?: stri
 
     return { summary, headlines, sources };
   } catch (error) {
-    console.warn("Market context fetch failed, proceeding without it.", error);
+    // If search fails due to quota, we can return empty data rather than crashing the whole flow if called optionally
+    console.warn("Market context fetch failed or quota hit.", error);
+    if ((error as any)?.status === 429) {
+        return { summary: "⚠️ INTEL UNAVAILABLE (RATE LIMIT).", headlines: ["System cooling down..."], sources: [] };
+    }
     return { summary: "Market data unavailable.", headlines: [], sources: [] };
   }
 };
@@ -297,8 +318,7 @@ export const runSimulation = async (
     if (!text) throw new Error("Oracle failed to respond.");
     return JSON.parse(cleanJsonString(text)) as SimulationResult;
   } catch (error) {
-    console.error("Simulation failed:", error);
-    throw error;
+    return handleApiError(error, "Simulation");
   }
 };
 
@@ -362,7 +382,6 @@ export const calculateBacktestScore = async (
       timestamp: Date.now()
     };
   } catch (error) {
-    console.error("Backtest failed:", error);
-    throw error;
+    return handleApiError(error, "Backtest");
   }
 };
