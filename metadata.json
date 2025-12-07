@@ -1,0 +1,5 @@
+{
+  "name": "Chart Wargame",
+  "description": "A tactical financial analysis tool that uses AI to simulate 'What If' scenarios on stock and crypto charts, visualizing potential market movements via Ghost Candles.",
+  "requestFramePermissions": []
+}
