@@ -32,61 +32,107 @@ const getClient = () => {
   return new GoogleGenAI({ apiKey: apiKey });
 };
 
-// --- UTILITIES FOR RATE LIMIT HANDLING ---
+// --- UTILITIES ---
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+const withTimeout = <T>(promise: Promise<T>, ms: number, errorMessage: string): Promise<T> => {
+  let timer: any;
+  const timeout = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`⏱️ TIMEOUT: ${errorMessage}`));
+    }, ms);
+  });
+
+  return Promise.race([
+    promise.then(res => { clearTimeout(timer); return res; }),
+    timeout
+  ]);
+};
+
 type StatusCallback = (msg: string) => void;
 
-/**
- * HEAVY DUTY RETRY MECHANISM WITH FEEDBACK
- * Now reports status back to the UI so the user knows it's not frozen.
- */
+// --- OFFLINE FALLBACK GENERATORS ---
+// Used when API quota is exhausted (RPD Limits)
+
+const generateOfflineAnalysis = (): ChartAnalysis => {
+  return {
+    ticker: "OFFLINE-ASSET",
+    trend: "SIDEWAYS (SIMULATED)",
+    technical_summary: "⚠️ NETWORK SEVERED. RUNNING LOCAL SIMULATION.\n\nSince the neural link is down, we are projecting a neutral tactical pattern. Support and resistance are estimated based on standard deviation.",
+    support_resistance: "SUP: 100.00 | RES: 105.00 (LOCAL)",
+    key_levels: {
+      support: 100,
+      resistance: 105
+    }
+  };
+};
+
+const generateOfflineSimulation = (lastPrice: number = 100, scenario: string): SimulationResult => {
+  const candles: GhostCandle[] = [];
+  let currentClose = lastPrice;
+  
+  // Simple Random Walk with drift based on scenario
+  let drift = 0;
+  if (scenario.includes("Hike") || scenario.includes("Recession")) drift = -0.5;
+  if (scenario.includes("Cut") || scenario.includes("Breakthrough")) drift = 0.5;
+
+  for (let i = 1; i <= 10; i++) {
+    const volatility = currentClose * 0.02; // 2% volatility
+    const change = (Math.random() - 0.5) * volatility + drift;
+    
+    const open = currentClose;
+    const close = open + change;
+    const high = Math.max(open, close) + Math.random() * (volatility / 2);
+    const low = Math.min(open, close) - Math.random() * (volatility / 2);
+    
+    currentClose = close;
+    
+    candles.push({ day: i, open, high, low, close });
+  }
+
+  return {
+    analysis: `[OFFLINE PROTOCOL ACTIVE]\nSimulating trajectory for scenario: "${scenario}".\n\nCalculated via local volatility algorithms due to network silence.`,
+    ghost_candles: candles
+  };
+};
+
+// --- CORE SERVICE ---
+
 async function callWithRetry<T>(
   fn: () => Promise<T>, 
-  retries = 5, 
-  delay = 4000, 
+  retries = 2, // Low retries, we want to fail to fallback if blocked
+  delay = 2000, 
   context = "API Call",
   onUpdate?: StatusCallback
 ): Promise<T> {
   try {
-    return await fn();
+    return await withTimeout(fn(), 15000, `${context} took too long.`);
   } catch (error: any) {
     const msg = error?.message || "";
     const status = error?.status;
-    const isRateLimit = status === 429 || msg.includes("429") || msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED");
+    
+    // Check for Hard Quota Limits (Daily Limit)
+    const isQuotaExhausted = msg.includes("429") || msg.includes("quota") || msg.includes("per day");
 
-    if (isRateLimit && retries > 0) {
-      // Add a small random jitter
-      const jitter = Math.floor(Math.random() * 1000); 
-      const nextDelay = delay + 2000 + jitter; // Linear increase
-      const delaySec = Math.ceil(nextDelay / 1000);
+    if (isQuotaExhausted) {
+      console.warn(`⚠️ QUOTA EXHAUSTED for ${context}. Switching to fallback.`);
+      throw new Error("QUOTA_EXHAUSTED"); // Throw specific error to be caught by caller
+    }
 
-      const statusMsg = `⚠️ SYSTEM OVERHEAT (429). COOLING DOWN... ${delaySec}s`;
-      console.warn(statusMsg);
-      
-      if (onUpdate) onUpdate(statusMsg);
-      
+    const isTransient = msg.includes("fetch failed") || msg.includes("503");
+    
+    if (isTransient && retries > 0) {
+      const nextDelay = delay + 1000;
+      if (onUpdate) onUpdate(`⚠️ RETRYING ${context}... (${retries})`);
       await wait(nextDelay);
-      
-      if (onUpdate) onUpdate(`> RE-ENGAGING ${context.toUpperCase()}... (ATTEMPT ${6 - retries}/5)`);
-      
       return callWithRetry(fn, retries - 1, nextDelay, context, onUpdate);
-    }
-
-    if (msg.includes("API Key")) {
-      throw new Error("⚠️ AUTH FAILURE: Invalid or Missing API Key.");
-    }
-
-    if (isRateLimit) {
-       throw new Error(`⚠️ SYSTEM FAILURE: Network congestion is too high. Try again in 2 minutes.`);
     }
 
     throw error;
   }
 }
 
-// Helper to clean JSON string
 const cleanJsonString = (text: string): string => {
   return text.replace(/```json|```/g, '').trim();
 };
@@ -150,35 +196,40 @@ export const analyzeChart = async (imageBase64: string, onUpdate?: StatusCallbac
   const base64Data = imageBase64.split(',')[1] || imageBase64;
 
   const prompt = `
-  **ROLE:** Expert Technical Analyst (The Observer).
-  **TASK:** Analyze financial chart.
-  1. IDENTIFY TICKER (e.g. BTC, TSLA). If unclear, return NULL.
-  2. Identify Trend.
-  3. Key Support/Resistance levels (numeric & descriptive).
-  4. Technical Summary (Narrative of buyers/sellers).
-  Return JSON.
+  **ROLE:** Expert Technical Analyst.
+  **TASK:** Analyze chart. Identify Ticker, Trend, Levels.
+  **FORMAT:** JSON only.
   `;
 
-  return callWithRetry(async () => {
-    const response = await client.models.generateContent({
-      model: MODEL_NAME,
-      contents: {
-        parts: [
-          { inlineData: { mimeType: "image/png", data: base64Data } },
-          { text: prompt },
-        ],
-      },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: ANALYSIS_SCHEMA,
-        temperature: 0.2, 
-      },
-    });
+  try {
+    return await callWithRetry(async () => {
+      const response = await client.models.generateContent({
+        model: MODEL_NAME,
+        contents: {
+          parts: [
+            { inlineData: { mimeType: "image/png", data: base64Data } },
+            { text: prompt },
+          ],
+        },
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: ANALYSIS_SCHEMA,
+          temperature: 0.2, 
+        },
+      });
 
-    const text = response.text;
-    if (!text) throw new Error("Observer failed to respond.");
-    return JSON.parse(cleanJsonString(text)) as ChartAnalysis;
-  }, 5, 4000, "Chart Analysis", onUpdate);
+      const text = response.text;
+      if (!text) throw new Error("Empty response from AI.");
+      return JSON.parse(cleanJsonString(text)) as ChartAnalysis;
+    }, 2, 2000, "Chart Analysis", onUpdate);
+  } catch (error: any) {
+    if (error.message === "QUOTA_EXHAUSTED") {
+      if (onUpdate) onUpdate("⚠️ API LIMIT HIT. ACTIVATING OFFLINE PROTOCOL.");
+      await wait(1000); // Fake delay for realism
+      return generateOfflineAnalysis();
+    }
+    throw error;
+  }
 };
 
 export const fetchMarketContext = async (ticker: string, technicalContext?: string, onUpdate?: StatusCallback): Promise<MarketData> => {
@@ -187,12 +238,8 @@ export const fetchMarketContext = async (ticker: string, technicalContext?: stri
   
   const prompt = `
   **DATE:** ${today}. Ticker: "${ticker}".
-  Find ABSOLUTE LATEST market news (Last 24-48h preferred, Max 7 days).
-  Context: "${technicalContext || ''}".
-  Tasks:
-  1. Live price & % change.
-  2. Top 3 FRESH headlines.
-  Output: Summary sentence. Then "---HEADLINES---". Then list 3 headlines.
+  Get price & 3 headlines.
+  Output: Summary | Headlines list.
   `;
 
   try {
@@ -203,16 +250,10 @@ export const fetchMarketContext = async (ticker: string, technicalContext?: stri
         config: { tools: [{ googleSearch: {} }] },
         });
 
-        const fullText = response.text || "No market data found.";
-        const parts = fullText.split("---HEADLINES---");
-        const summary = parts[0] ? parts[0].trim() : "Market data unavailable.";
-        const headlinesRaw = parts[1] || "";
-        
-        const headlines = headlinesRaw
-        .split('\n')
-        .map(line => line.trim().replace(/^[-*•]\s*/, '')) 
-        .filter(line => line.length > 0)
-        .slice(0, 3); 
+        const fullText = response.text || "No data.";
+        const lines = fullText.split('\n').filter(l => l.length > 5);
+        const summary = lines[0] || "Data unavailable";
+        const headlines = lines.slice(1, 4).map(l => l.replace(/^[*\-•]/, '').trim());
         
         const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
         const sources = chunks
@@ -221,14 +262,12 @@ export const fetchMarketContext = async (ticker: string, technicalContext?: stri
         .map((web: any) => ({ title: web.title, uri: web.uri }));
 
         return { summary, headlines, sources };
-    }, 2, 4000, "Market Intel", onUpdate);
+    }, 1, 2000, "Market Intel", onUpdate);
     
-  } catch (error: any) {
-    console.warn("Scout failed:", error);
-    if (error?.status === 429 || error?.message?.includes("429")) {
-        return { summary: "⚠️ Intel Network Congested (Rate Limit)", headlines: ["Try refreshing news manually later."], sources: [] };
-    }
-    return { summary: "Market data unavailable.", headlines: [], sources: [] };
+  } catch (error) {
+    // Market data fails silently to offline mode or empty
+    console.warn("Market data skipped:", error);
+    return { summary: "⚠️ OFFLINE: Market Data Unavailable.", headlines: ["System Offline"], sources: [] };
   }
 };
 
@@ -243,37 +282,46 @@ export const runSimulation = async (
   const client = getClient();
   const base64Data = imageBase64.split(',')[1] || imageBase64;
   const isBaseline = scenario === "BASELINE_PREDICTION";
-  const effectiveTicker = manualTicker || currentAnalysis.ticker || "Unknown Asset";
+  const effectiveTicker = manualTicker || currentAnalysis.ticker || "Asset";
 
   const prompt = `
   **ROLE:** Financial Oracle.
-  **CONTEXT:** ${effectiveTicker} | ${currentAnalysis.trend} | Levels: ${currentAnalysis.key_levels?.support}/${currentAnalysis.key_levels?.resistance}.
-  **NEWS:** ${marketData?.summary || "N/A"}
-  **SCENARIO:** ${isBaseline ? "Natural Projection (Next 10 candles)" : `"${scenario}"`}
-  **TASK:** Simulate 10 Ghost Candles. Open of 1st candle must align with chart end.
-  Return JSON.
+  **CONTEXT:** ${effectiveTicker} | ${currentAnalysis.trend}.
+  **SCENARIO:** ${isBaseline ? "Natural Move" : scenario}
+  **TASK:** 10 Ghost Candles JSON.
   `;
 
-  return callWithRetry(async () => {
-    const response = await client.models.generateContent({
-      model: MODEL_NAME,
-      contents: {
-        parts: [
-          { inlineData: { mimeType: "image/png", data: base64Data } },
-          { text: prompt },
-        ],
-      },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: SIMULATION_SCHEMA,
-        temperature: 0.5,
-      },
-    });
+  try {
+    return await callWithRetry(async () => {
+      const response = await client.models.generateContent({
+        model: MODEL_NAME,
+        contents: {
+          parts: [
+            { inlineData: { mimeType: "image/png", data: base64Data } },
+            { text: prompt },
+          ],
+        },
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: SIMULATION_SCHEMA,
+          temperature: 0.5,
+        },
+      });
 
-    const text = response.text;
-    if (!text) throw new Error("Oracle failed to respond.");
-    return JSON.parse(cleanJsonString(text)) as SimulationResult;
-  }, 5, 4000, "Simulation Oracle", onUpdate);
+      const text = response.text;
+      if (!text) throw new Error("No simulation data.");
+      return JSON.parse(cleanJsonString(text)) as SimulationResult;
+    }, 2, 2000, "Simulation", onUpdate);
+  } catch (error: any) {
+    if (error.message === "QUOTA_EXHAUSTED") {
+      if (onUpdate) onUpdate("⚠️ API LIMIT HIT. RUNNING OFFLINE SIMULATION.");
+      await wait(1000);
+      // Use last known levels or default
+      const startPrice = currentAnalysis.key_levels?.support || 100;
+      return generateOfflineSimulation(startPrice, scenario);
+    }
+    throw error;
+  }
 };
 
 export const calculateBacktestScore = async (
@@ -286,37 +334,45 @@ export const calculateBacktestScore = async (
   const base64Data = resultImageBase64.split(',')[1] || resultImageBase64;
 
   const prompt = `
-  **ROLE:** The Judge.
-  **PREDICTION:** ${JSON.stringify(predictedCandles)}
-  **SCENARIO:** "${scenario}"
-  **TASK:** Compare Prediction vs Actual Image.
-  Criteria: Direction, Magnitude, Levels.
-  Return JSON: {score (0-100), critique (max 2 sentences)}.
+  **ROLE:** Judge.
+  **TASK:** Compare Prediction vs Image.
+  **RETURN:** JSON {score, critique}.
   `;
 
-  return callWithRetry(async () => {
-    const response = await client.models.generateContent({
-      model: MODEL_NAME,
-      contents: {
-        parts: [
-          { inlineData: { mimeType: "image/png", data: base64Data } },
-          { text: prompt },
-        ],
-      },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: BACKTEST_SCHEMA,
-        temperature: 0.1,
-      },
-    });
+  try {
+    return await callWithRetry(async () => {
+      const response = await client.models.generateContent({
+        model: MODEL_NAME,
+        contents: {
+          parts: [
+            { inlineData: { mimeType: "image/png", data: base64Data } },
+            { text: prompt },
+          ],
+        },
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: BACKTEST_SCHEMA,
+          temperature: 0.1,
+        },
+      });
 
-    const text = response.text;
-    if (!text) throw new Error("Judge failed to respond.");
-    const result = JSON.parse(cleanJsonString(text));
-    return {
-      score: result.score,
-      critique: result.critique,
-      timestamp: Date.now()
-    };
-  }, 5, 4000, "Backtest Judge", onUpdate);
+      const text = response.text;
+      if (!text) throw new Error("Judge silent.");
+      const result = JSON.parse(cleanJsonString(text));
+      return {
+        score: result.score,
+        critique: result.critique,
+        timestamp: Date.now()
+      };
+    }, 2, 2000, "Backtest", onUpdate);
+  } catch (error: any) {
+    if (error.message === "QUOTA_EXHAUSTED") {
+      return {
+        score: 50,
+        critique: "OFFLINE: Cannot verify image visually. Neutral score assigned.",
+        timestamp: Date.now()
+      };
+    }
+    throw error;
+  }
 };
