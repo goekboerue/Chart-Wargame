@@ -10,12 +10,30 @@ declare var process: {
   };
 };
 
-const getClient = () => {
-  const apiKey = process.env.API_KEY;
-  if (!apiKey) {
-    console.error("API Key is missing. Check your environment variables.");
+const getApiKey = (): string => {
+  // 1. Try standard process.env (Node/Bundler replaced)
+  if (process.env.API_KEY) return process.env.API_KEY;
+
+  // 2. Try Vite-specific import.meta.env (Client-side)
+  try {
+    // @ts-ignore
+    const viteEnv = import.meta.env;
+    if (viteEnv) {
+      return viteEnv.VITE_API_KEY || viteEnv.API_KEY || "";
+    }
+  } catch (e) {
+    // Ignore if import.meta is not defined
   }
-  return new GoogleGenAI({ apiKey: apiKey || "" });
+
+  return "";
+};
+
+const getClient = () => {
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    console.error("CRITICAL: API Key is missing. Ensure API_KEY or VITE_API_KEY is set in your environment.");
+  }
+  return new GoogleGenAI({ apiKey: apiKey });
 };
 
 // Schema for Step 1: Observer
