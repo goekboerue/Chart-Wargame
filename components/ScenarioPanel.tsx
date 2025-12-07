@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { PRESET_SCENARIOS } from '../constants';
-import { Activity, AlertTriangle, TrendingDown, TrendingUp, Zap, UserX, Rocket } from 'lucide-react';
+import { Activity, AlertTriangle, TrendingDown, TrendingUp, Zap, UserX, Rocket, Percent, DollarSign, BarChart3, Anchor } from 'lucide-react';
 import { Scenario } from '../types';
 
 interface ScenarioPanelProps {
@@ -21,6 +21,10 @@ const ScenarioPanel: React.FC<ScenarioPanelProps> = ({ onSimulate, isLoading }) 
       case 'user-x': return <UserX size={18} />;
       case 'rocket': return <Rocket size={18} />;
       case 'activity': return <Activity size={18} />;
+      case 'percent': return <Percent size={18} />;
+      case 'dollar-sign': return <DollarSign size={18} />;
+      case 'bar-chart-3': return <BarChart3 size={18} />;
+      case 'anchor': return <Anchor size={18} />;
       default: return <Activity size={18} />;
     }
   };
