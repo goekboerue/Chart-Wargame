@@ -61,5 +61,6 @@ export const PRESET_SCENARIOS: Scenario[] = [
 // Primary: The Hybrid Beast (Vision + Reasoning)
 export const MODEL_NAME = 'gemini-2.5-flash'; 
 
-// Fallback: The Light Scout (Faster, Cheaper, Lower Limits)
-export const FALLBACK_MODEL_NAME = 'gemini-2.0-flash-lite-preview-02-05';
+// Fallback: The Experimental Channel (High Limits, Raw Power)
+// User requested "Live", but Live is WebSocket only. using EXP as the high-quota alternative.
+export const FALLBACK_MODEL_NAME = 'gemini-2.0-flash-exp';
