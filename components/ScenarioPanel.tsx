@@ -108,7 +108,7 @@ const ScenarioPanel: React.FC<ScenarioPanelProps> = ({ onSimulate, isLoading }) 
       
       {isLoading && (
         <div className="mt-4 p-3 bg-gray-900 border border-gray-700 text-gray-500 text-xs font-mono flex items-center justify-center animate-pulse">
-           > PROCESSING INTELLIGENCE STREAM...
+           &gt; PROCESSING INTELLIGENCE STREAM...
         </div>
       )}
     </div>
