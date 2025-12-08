@@ -69,7 +69,7 @@ async function executeWithModelPipeline<T>(
 ): Promise<T & { model_used: string }> {
   
   const models = MODEL_PIPELINE;
-  let lastError: any = null;
+  const errorLog: string[] = [];
 
   for (let i = 0; i < models.length; i++) {
     const currentModel = models[i];
@@ -77,24 +77,24 @@ async function executeWithModelPipeline<T>(
 
     try {
       if (isFallback && onUpdate) {
-        onUpdate(`⚠️ ENGAGING BACKUP ENGINE: ${currentModel}...`);
-        // Small delay to prevent hammering if loop is fast
-        await wait(500); 
+        onUpdate(`⚠️ ENGINE FAILURE. REROUTING TO: ${currentModel}...`);
+        // Increased cool-down to 2000ms to avoid rapid rate-limit triggers
+        await wait(2000); 
       }
 
       // WRAPPER: Retry logic PER MODEL
-      // We try the *current* model a couple of times for transient errors
-      // If it fails with a Critical Error (429, 503, etc), we break inner loop and go to next model
       const result = await attemptModelExecution(apiCall, currentModel, operationName, onUpdate);
       
       return { ...result, model_used: currentModel };
 
     } catch (error: any) {
-      lastError = error;
-      const msg = (error?.message || "").toLowerCase();
+      const msg = (error?.message || "Unknown error").toLowerCase();
       
+      // Log failure for final report
+      const shortMsg = msg.includes("429") ? "Quota Limit" : msg.includes("503") ? "Server Busy" : "Error";
+      errorLog.push(`${currentModel}: ${shortMsg}`);
+
       // Determine if we should switch models
-      // We switch on: 429 (Too Many Requests), 503 (Service Unavailable), 500 (Internal Error), or Fetch Failures
       const isRecoverableBySwitching = 
         msg.includes("429") || 
         msg.includes("quota") || 
@@ -104,9 +104,6 @@ async function executeWithModelPipeline<T>(
         msg.includes("fetch failed") ||
         msg.includes("overloaded");
 
-      // Critical errors that imply we shouldn't even try other models (e.g. Bad Request due to content)
-      // Actually, for "safety" blocks, sometimes other models are more lenient, so we might want to try them too.
-      // But "Invalid API Key" (400/401) is definitely fatal.
       const isFatal = msg.includes("api key") || msg.includes("permission denied");
 
       if (isFatal) {
@@ -114,27 +111,27 @@ async function executeWithModelPipeline<T>(
       }
 
       if (isRecoverableBySwitching) {
-        // If this was the last model, throw
+        // If this was the last model, throw complete report
         if (i === models.length - 1) {
            console.error("All models exhausted.");
-           throw new Error(`⚠️ CRITICAL: ALL ENGINES FAILED. LAST ERROR: ${msg}`);
+           throw new Error(`CRITICAL: ALL ENGINES FAILED.\n[${errorLog.join(' -> ')}]`);
         }
         // Otherwise, continue to next model (Fallback)
         console.warn(`Model ${currentModel} failed (${msg}). Switching...`);
         continue; 
       }
 
-      // For other unknown errors, we generally try the next model just in case it's a model-specific glitch
+      // For other unknown errors, try next model as a hail mary
       if (i < models.length - 1) {
          console.warn(`Model ${currentModel} encountered unknown error. Switching...`);
          continue;
       }
 
-      throw error;
+      throw new Error(`EXECUTION FAILED: ${msg}`);
     }
   }
 
-  throw lastError;
+  throw new Error("Unknown pipeline failure.");
 }
 
 // Inner helper to handle transient retries for a SINGLE model
@@ -149,7 +146,7 @@ async function attemptModelExecution<T>(
 
   while (true) {
     try {
-      return await withTimeout(apiCall(model), 25000, `${context} (${model})`);
+      return await withTimeout(apiCall(model), 30000, `${context} (${model})`);
     } catch (error: any) {
       const msg = (error?.message || "").toLowerCase();
       
@@ -158,7 +155,6 @@ async function attemptModelExecution<T>(
       if (isHardError) throw error; 
 
       if (retries > 0) {
-        // It might be a simple network glitch
         if (onUpdate) onUpdate(`⚠️ RETRYING ${context} (${retries})...`);
         await wait(delay);
         retries--;

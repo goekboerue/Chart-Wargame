@@ -59,11 +59,12 @@ export const PRESET_SCENARIOS: Scenario[] = [
 
 // --- MODEL CONFIGURATION ---
 
-// The Model Pipeline: Tried in order.
+// The Model Pipeline: Tried in order until one succeeds.
 export const MODEL_PIPELINE = [
   'gemini-2.5-flash',                   // 1. Primary (High IQ)
-  'gemini-2.5-flash-lite-preview-02-05', // 2. Secondary (Quota Available)
-  'gemini-2.0-flash-exp'                // 3. Tertiary (High Limits / Experimental)
+  'gemini-2.0-flash-lite-preview-02-05', // 2. Secondary (Efficient, often has quota)
+  'gemini-2.0-flash',                   // 3. Standard Stable (Reliable backup)
+  'gemini-2.0-pro-exp-02-05'            // 4. Heavy Duty Backup (Pro Experimental)
 ];
 
 export const MODEL_NAME = MODEL_PIPELINE[0]; // For backward compatibility ref
