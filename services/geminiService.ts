@@ -1,6 +1,6 @@
 import { GoogleGenAI, Schema, Type } from "@google/genai";
 import { ChartAnalysis, SimulationResult, MarketData, GhostCandle, BacktestResult } from "../types";
-import { MODEL_NAME, FALLBACK_MODEL_NAME } from "../constants";
+import { MODEL_PIPELINE } from "../constants";
 
 // Declare process to avoid TypeScript build errors
 declare var process: {
@@ -56,21 +56,19 @@ const cleanJsonString = (text: string): string => {
 
 type StatusCallback = (msg: string) => void;
 
-// --- DUAL-ENGINE EXECUTION CORE ---
+// --- MULTI-ENGINE EXECUTION CORE ---
 
 /**
- * Executes a GenAI request with Fallback logic.
- * 1. Tries PRIMARY model.
- * 2. If Quota/Rate Limit (429) -> Switches to FALLBACK model.
- * 3. Returns data + model name.
+ * Executes a GenAI request with a robust Pipeline strategy.
+ * Iterates through MODEL_PIPELINE.
  */
-async function executeWithModelFallback<T>(
+async function executeWithModelPipeline<T>(
   operationName: string,
   onUpdate: StatusCallback | undefined,
   apiCall: (model: string) => Promise<T>
 ): Promise<T & { model_used: string }> {
   
-  const models = [MODEL_NAME, FALLBACK_MODEL_NAME];
+  const models = MODEL_PIPELINE;
   let lastError: any = null;
 
   for (let i = 0; i < models.length; i++) {
@@ -79,35 +77,59 @@ async function executeWithModelFallback<T>(
 
     try {
       if (isFallback && onUpdate) {
-        onUpdate(`⚠️ PRIMARY ENGINE LIMIT. ENGAGING FALLBACK (${currentModel})...`);
-        await wait(1000); // Brief cool-down before switching engines
-      } else if (onUpdate) {
-        // Normal update
+        onUpdate(`⚠️ ENGAGING BACKUP ENGINE: ${currentModel}...`);
+        // Small delay to prevent hammering if loop is fast
+        await wait(500); 
       }
 
       // WRAPPER: Retry logic PER MODEL
       // We try the *current* model a couple of times for transient errors
-      // If it's a hard 429, we break this inner loop to go to the next model
+      // If it fails with a Critical Error (429, 503, etc), we break inner loop and go to next model
       const result = await attemptModelExecution(apiCall, currentModel, operationName, onUpdate);
       
       return { ...result, model_used: currentModel };
 
     } catch (error: any) {
       lastError = error;
-      const msg = error?.message || "";
-      const isQuota = msg.includes("429") || msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED");
+      const msg = (error?.message || "").toLowerCase();
+      
+      // Determine if we should switch models
+      // We switch on: 429 (Too Many Requests), 503 (Service Unavailable), 500 (Internal Error), or Fetch Failures
+      const isRecoverableBySwitching = 
+        msg.includes("429") || 
+        msg.includes("quota") || 
+        msg.includes("resource_exhausted") ||
+        msg.includes("503") || 
+        msg.includes("service unavailable") ||
+        msg.includes("fetch failed") ||
+        msg.includes("overloaded");
 
-      if (isQuota) {
+      // Critical errors that imply we shouldn't even try other models (e.g. Bad Request due to content)
+      // Actually, for "safety" blocks, sometimes other models are more lenient, so we might want to try them too.
+      // But "Invalid API Key" (400/401) is definitely fatal.
+      const isFatal = msg.includes("api key") || msg.includes("permission denied");
+
+      if (isFatal) {
+        throw error;
+      }
+
+      if (isRecoverableBySwitching) {
         // If this was the last model, throw
         if (i === models.length - 1) {
-           throw new Error(`⚠️ CRITICAL: ALL ENGINES DEPLETED. TRY AGAIN TOMORROW.`);
+           console.error("All models exhausted.");
+           throw new Error(`⚠️ CRITICAL: ALL ENGINES FAILED. LAST ERROR: ${msg}`);
         }
         // Otherwise, continue to next model (Fallback)
-        console.warn(`Model ${currentModel} exhausted. Switching...`);
+        console.warn(`Model ${currentModel} failed (${msg}). Switching...`);
         continue; 
       }
 
-      // If it's not a quota error (e.g. Invalid Image, Content Policy), don't switch models, just fail.
+      // For other unknown errors, we generally try the next model just in case it's a model-specific glitch
+      if (i < models.length - 1) {
+         console.warn(`Model ${currentModel} encountered unknown error. Switching...`);
+         continue;
+      }
+
       throw error;
     }
   }
@@ -122,22 +144,22 @@ async function attemptModelExecution<T>(
   context: string,
   onUpdate?: StatusCallback
 ): Promise<T> {
-  let retries = 2; // Reduced retries per model
-  let delay = 2000;
+  let retries = 1; // 1 retry per model before switching
+  let delay = 1500;
 
   while (true) {
     try {
-      return await withTimeout(apiCall(model), 20000, `${context} (${model})`);
+      return await withTimeout(apiCall(model), 25000, `${context} (${model})`);
     } catch (error: any) {
-      const msg = error?.message || "";
-      const isTransient = msg.includes("fetch failed") || msg.includes("503");
-      const isQuota = msg.includes("429") || msg.includes("quota");
+      const msg = (error?.message || "").toLowerCase();
+      
+      // Immediate fail to outer loop if it looks like a hard limit or server error
+      const isHardError = msg.includes("429") || msg.includes("quota") || msg.includes("503");
+      if (isHardError) throw error; 
 
-      // Immediate fail to outer loop if Quota
-      if (isQuota) throw error; 
-
-      if (isTransient && retries > 0) {
-        if (onUpdate) onUpdate(`⚠️ RETRYING ${context}... (${retries})`);
+      if (retries > 0) {
+        // It might be a simple network glitch
+        if (onUpdate) onUpdate(`⚠️ RETRYING ${context} (${retries})...`);
         await wait(delay);
         retries--;
         delay += 1000;
@@ -214,7 +236,7 @@ export const analyzeChart = async (imageBase64: string, onUpdate?: StatusCallbac
   **FORMAT:** JSON only.
   `;
 
-  return await executeWithModelFallback(
+  return await executeWithModelPipeline(
     "Chart Analysis",
     onUpdate,
     async (model) => {
@@ -250,13 +272,13 @@ export const fetchMarketContext = async (ticker: string, technicalContext?: stri
   Output: Summary | Headlines list.
   `;
 
-  // Market data relies on tools. If fallback model doesn't support tools, this might fail or fallback to text only.
-  // 2.0 Flash Lite usually supports tools, but let's be careful.
   try {
-     return await executeWithModelFallback(
+     return await executeWithModelPipeline(
       "Market Intel",
       onUpdate,
       async (model) => {
+          // Note: Some models (like flash-lite) might have different tool support.
+          // If googleSearch fails on a model, this block throws, and the pipeline tries the next model.
           const response = await client.models.generateContent({
           model: model,
           contents: prompt,
@@ -303,7 +325,7 @@ export const runSimulation = async (
   **TASK:** 10 Ghost Candles JSON. Strict technical adherence.
   `;
 
-  return await executeWithModelFallback(
+  return await executeWithModelPipeline(
     "Simulation",
     onUpdate,
     async (model) => {
@@ -344,7 +366,7 @@ export const calculateBacktestScore = async (
   **RETURN:** JSON {score, critique}.
   `;
 
-  return await executeWithModelFallback(
+  return await executeWithModelPipeline(
     "Backtest",
     onUpdate,
     async (model) => {

@@ -58,9 +58,12 @@ export const PRESET_SCENARIOS: Scenario[] = [
 ];
 
 // --- MODEL CONFIGURATION ---
-// Primary: The Hybrid Beast (Vision + Reasoning)
-export const MODEL_NAME = 'gemini-2.5-flash'; 
 
-// Fallback: The Experimental Channel (High Limits, Raw Power)
-// User requested "Live", but Live is WebSocket only. using EXP as the high-quota alternative.
-export const FALLBACK_MODEL_NAME = 'gemini-2.0-flash-exp';
+// The Model Pipeline: Tried in order.
+export const MODEL_PIPELINE = [
+  'gemini-2.5-flash',                   // 1. Primary (High IQ)
+  'gemini-2.5-flash-lite-preview-02-05', // 2. Secondary (Quota Available)
+  'gemini-2.0-flash-exp'                // 3. Tertiary (High Limits / Experimental)
+];
+
+export const MODEL_NAME = MODEL_PIPELINE[0]; // For backward compatibility ref
